@@ -4,6 +4,8 @@ This LSTM-based generative language model simply learns to
 predict the next character, based on the sequences of characters
 seen so far. For a good inttroduction to char-RNN (or char-LSTM),
 @see http://karpathy.github.io/2015/05/21/rnn-effectiveness/.
+(Note: @karpathy recommends a larger model both in terms of
+LSTM layers and the number of units.)
 
 At least 20 epochs are required before the generated text
 starts sounding coherent.
