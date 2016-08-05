@@ -1,5 +1,10 @@
 '''Example script to generate text from Nietzsche's writings.
 
+This LSTM-based generative language model simply learns to
+predict the next character, based on the sequences of characters
+seen so far. For a good inttroduction to char-RNN (or char-LSTM),
+@see http://karpathy.github.io/2015/05/21/rnn-effectiveness/.
+
 At least 20 epochs are required before the generated text
 starts sounding coherent.
 
@@ -40,8 +45,8 @@ for i in range(0, len(text) - maxlen, step):
 print('nb sequences:', len(sentences))
 
 print('Vectorization...')
-X = np.zeros((len(sentences), maxlen, len(chars)), dtype=np.bool)
-y = np.zeros((len(sentences), len(chars)), dtype=np.bool)
+X = np.zeros((len(sentences), maxlen, len(chars)), dtype=np.bool)   # input: sequence of chars
+y = np.zeros((len(sentences), len(chars)), dtype=np.bool)           # output: next char (to predict)
 for i, sentence in enumerate(sentences):
     for t, char in enumerate(sentence):
         X[i, t, char_indices[char]] = 1
