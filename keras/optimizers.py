@@ -135,14 +135,19 @@ class SGD(Optimizer):
         self.lr = K.variable(lr)
         self.momentum = K.variable(momentum)
         self.decay = K.variable(decay)
+        self.inital_decay = decay
 
     def get_updates(self, params, constraints, loss):
         grads = self.get_gradients(loss, params)
-        lr = self.lr * (1. / (1. + self.decay * self.iterations))
-        self.updates = [K.update_add(self.iterations, 1)]
+        self.updates = []
+
+        lr = self.lr
+        if self.inital_decay > 0:
+            lr *= (1. / (1. + self.decay * self.iterations))
+            self.updates .append(K.update_add(self.iterations, 1))
 
         # momentum
-        shapes = [x.shape for x in K.batch_get_value(params)]
+        shapes = [K.get_variable_shape(p) for p in params]
         moments = [K.zeros(shape) for shape in shapes]
         self.weights = [self.iterations] + moments
         for p, g, m in zip(params, grads, moments):
@@ -185,25 +190,35 @@ class RMSprop(Optimizer):
         lr: float >= 0. Learning rate.
         rho: float >= 0.
         epsilon: float >= 0. Fuzz factor.
+        decay: float >= 0. Learning rate decay over each update.
     '''
-    def __init__(self, lr=0.001, rho=0.9, epsilon=1e-8, **kwargs):
+    def __init__(self, lr=0.001, rho=0.9, epsilon=1e-8, decay=0.,
+                 **kwargs):
         super(RMSprop, self).__init__(**kwargs)
         self.__dict__.update(locals())
         self.lr = K.variable(lr)
         self.rho = K.variable(rho)
+        self.decay = K.variable(decay)
+        self.inital_decay = decay
+        self.iterations = K.variable(0.)
 
     def get_updates(self, params, constraints, loss):
         grads = self.get_gradients(loss, params)
-        shapes = [x.shape for x in K.batch_get_value(params)]
+        shapes = [K.get_variable_shape(p) for p in params]
         accumulators = [K.zeros(shape) for shape in shapes]
         self.weights = accumulators
         self.updates = []
+
+        lr = self.lr
+        if self.inital_decay > 0:
+            lr *= (1. / (1. + self.decay * self.iterations))
+            self.updates.append(K.update_add(self.iterations, 1))
 
         for p, g, a in zip(params, grads, accumulators):
             # update accumulator
             new_a = self.rho * a + (1. - self.rho) * K.square(g)
             self.updates.append(K.update(a, new_a))
-            new_p = p - self.lr * g / (K.sqrt(new_a) + self.epsilon)
+            new_p = p - lr * g / (K.sqrt(new_a) + self.epsilon)
 
             # apply constraints
             if p in constraints:
@@ -229,23 +244,34 @@ class Adagrad(Optimizer):
     # Arguments
         lr: float >= 0. Learning rate.
         epsilon: float >= 0.
+
+    # References
+        - [Adaptive Subgradient Methods for Online Learning and Stochastic Optimization](http://www.jmlr.org/papers/volume12/duchi11a/duchi11a.pdf)
     '''
-    def __init__(self, lr=0.01, epsilon=1e-8, **kwargs):
+    def __init__(self, lr=0.01, epsilon=1e-8, decay=0., **kwargs):
         super(Adagrad, self).__init__(**kwargs)
         self.__dict__.update(locals())
         self.lr = K.variable(lr)
+        self.decay = K.variable(decay)
+        self.inital_decay = decay
+        self.iterations = K.variable(0.)
 
     def get_updates(self, params, constraints, loss):
         grads = self.get_gradients(loss, params)
-        shapes = [x.shape for x in K.batch_get_value(params)]
+        shapes = [K.get_variable_shape(p) for p in params]
         accumulators = [K.zeros(shape) for shape in shapes]
         self.weights = accumulators
         self.updates = []
 
+        lr = self.lr
+        if self.inital_decay > 0:
+            lr *= (1. / (1. + self.decay * self.iterations))
+            self.updates.append(K.update_add(self.iterations, 1))
+
         for p, g, a in zip(params, grads, accumulators):
             new_a = a + K.square(g)  # update accumulator
             self.updates.append(K.update(a, new_a))
-            new_p = p - self.lr * g / (K.sqrt(new_a) + self.epsilon)
+            new_p = p - lr * g / (K.sqrt(new_a) + self.epsilon)
             # apply constraints
             if p in constraints:
                 c = constraints[p]
@@ -275,18 +301,27 @@ class Adadelta(Optimizer):
     # References
         - [Adadelta - an adaptive learning rate method](http://arxiv.org/abs/1212.5701)
     '''
-    def __init__(self, lr=1.0, rho=0.95, epsilon=1e-8, **kwargs):
+    def __init__(self, lr=1.0, rho=0.95, epsilon=1e-8, decay=0.,
+                 **kwargs):
         super(Adadelta, self).__init__(**kwargs)
         self.__dict__.update(locals())
         self.lr = K.variable(lr)
+        self.decay = K.variable(decay)
+        self.inital_decay = decay
+        self.iterations = K.variable(0.)
 
     def get_updates(self, params, constraints, loss):
         grads = self.get_gradients(loss, params)
-        shapes = [x.shape for x in K.batch_get_value(params)]
+        shapes = [K.get_variable_shape(p) for p in params]
         accumulators = [K.zeros(shape) for shape in shapes]
         delta_accumulators = [K.zeros(shape) for shape in shapes]
         self.weights = accumulators + delta_accumulators
         self.updates = []
+
+        lr = self.lr
+        if self.inital_decay > 0:
+            lr *= (1. / (1. + self.decay * self.iterations))
+            self.updates.append(K.update_add(self.iterations, 1))
 
         for p, g, a, d_a in zip(params, grads, accumulators, delta_accumulators):
             # update accumulator
@@ -296,7 +331,7 @@ class Adadelta(Optimizer):
             # use the new accumulator and the *old* delta_accumulator
             update = g * K.sqrt(d_a + self.epsilon) / K.sqrt(new_a + self.epsilon)
 
-            new_p = p - self.lr * update
+            new_p = p - lr * update
             # apply constraints
             if p in constraints:
                 c = constraints[p]
@@ -330,22 +365,28 @@ class Adam(Optimizer):
         - [Adam - A Method for Stochastic Optimization](http://arxiv.org/abs/1412.6980v8)
     '''
     def __init__(self, lr=0.001, beta_1=0.9, beta_2=0.999,
-                 epsilon=1e-8, **kwargs):
+                 epsilon=1e-8, decay=0., **kwargs):
         super(Adam, self).__init__(**kwargs)
         self.__dict__.update(locals())
         self.iterations = K.variable(0)
         self.lr = K.variable(lr)
         self.beta_1 = K.variable(beta_1)
         self.beta_2 = K.variable(beta_2)
+        self.decay = K.variable(decay)
+        self.inital_decay = decay
 
     def get_updates(self, params, constraints, loss):
         grads = self.get_gradients(loss, params)
         self.updates = [K.update_add(self.iterations, 1)]
 
-        t = self.iterations + 1
-        lr_t = self.lr * K.sqrt(1. - K.pow(self.beta_2, t)) / (1. - K.pow(self.beta_1, t))
+        lr = self.lr
+        if self.inital_decay > 0:
+            lr *= (1. / (1. + self.decay * self.iterations))
 
-        shapes = [x.shape for x in K.batch_get_value(params)]
+        t = self.iterations + 1
+        lr_t = lr * K.sqrt(1. - K.pow(self.beta_2, t)) / (1. - K.pow(self.beta_1, t))
+
+        shapes = [K.get_variable_shape(p) for p in params]
         ms = [K.zeros(shape) for shape in shapes]
         vs = [K.zeros(shape) for shape in shapes]
         self.weights = [self.iterations] + ms + vs
@@ -390,22 +431,28 @@ class Adamax(Optimizer):
         - [Adam - A Method for Stochastic Optimization](http://arxiv.org/abs/1412.6980v8)
     '''
     def __init__(self, lr=0.002, beta_1=0.9, beta_2=0.999,
-                 epsilon=1e-8, **kwargs):
+                 epsilon=1e-8, decay=0., **kwargs):
         super(Adamax, self).__init__(**kwargs)
         self.__dict__.update(locals())
         self.iterations = K.variable(0.)
         self.lr = K.variable(lr)
         self.beta_1 = K.variable(beta_1)
         self.beta_2 = K.variable(beta_2)
+        self.decay = K.variable(decay)
+        self.inital_decay = decay
 
     def get_updates(self, params, constraints, loss):
         grads = self.get_gradients(loss, params)
         self.updates = [K.update_add(self.iterations, 1)]
 
+        lr = self.lr
+        if self.inital_decay > 0:
+            lr *= (1. / (1. + self.decay * self.iterations))
+
         t = self.iterations + 1
         lr_t = self.lr / (1. - K.pow(self.beta_1, t))
 
-        shapes = [x.shape for x in K.batch_get_value(params)]
+        shapes = [K.get_variable_shape(p) for p in params]
         # zero init of 1st moment
         ms = [K.zeros(shape) for shape in shapes]
         # zero init of exponentially weighted infinity norm
@@ -453,9 +500,8 @@ class Nadam(Optimizer):
         epsilon: float >= 0. Fuzz factor.
 
     # References
-        [1] Nadam report - http://cs229.stanford.edu/proj2015/054_report.pdf
-        [2] On the importance of initialization and momentum in deep learning -
-            http://www.cs.toronto.edu/~fritz/absps/momentum.pdf
+        - [Nadam report](http://cs229.stanford.edu/proj2015/054_report.pdf)
+        - [On the importance of initialization and momentum in deep learning](http://www.cs.toronto.edu/~fritz/absps/momentum.pdf)
     '''
     def __init__(self, lr=0.002, beta_1=0.9, beta_2=0.999,
                  epsilon=1e-8, schedule_decay=0.004, **kwargs):
@@ -481,7 +527,7 @@ class Nadam(Optimizer):
         m_schedule_next = self.m_schedule * momentum_cache_t * momentum_cache_t_1
         self.updates.append((self.m_schedule, m_schedule_new))
 
-        shapes = [x.shape for x in K.batch_get_value(params)]
+        shapes = [K.get_variable_shape(p) for p in params]
         ms = [K.zeros(shape) for shape in shapes]
         vs = [K.zeros(shape) for shape in shapes]
 

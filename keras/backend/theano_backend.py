@@ -5,12 +5,17 @@ from theano.tensor.signal import pool
 from theano.tensor.nnet import conv3d2d
 from theano.printing import Print
 try:
+    import theano.sparse as th_sparse_module
+except ImportError:
+    th_sparse_module = None
+try:
     from theano.tensor.nnet.nnet import softsign as T_softsign
 except ImportError:
     from theano.sandbox.softsign import softsign as T_softsign
 import inspect
 import numpy as np
 from .common import _FLOATX, _EPSILON, _IMAGE_DIM_ORDERING
+py_all = all
 
 
 # INTERNAL UTILS
@@ -30,17 +35,38 @@ def set_learning_phase(value):
                          '0 or 1.')
     _LEARNING_PHASE = value
 
-
 # VARIABLE MANIPULATION
+
+
+def _assert_sparse_module():
+    if not th_sparse_module:
+        raise ImportError("Failed to import theano.sparse\n"
+                          "You probably need to pip install nose-parameterized")
+
+
+def is_sparse(tensor):
+    return th_sparse_module and isinstance(tensor.type, th_sparse_module.SparseType)
+
+
+def to_dense(tensor):
+    if is_sparse(tensor):
+        return th_sparse_module.dense_from_sparse(tensor)
+    else:
+        return tensor
+
 
 def variable(value, dtype=_FLOATX, name=None):
     '''Instantiate a tensor variable.
     '''
-    value = np.asarray(value, dtype=dtype)
-    return theano.shared(value=value, name=name, strict=False)
+    if hasattr(value, 'tocoo'):
+        _assert_sparse_module()
+        return th_sparse_module.as_sparse_variable(value)
+    else:
+        value = np.asarray(value, dtype=dtype)
+        return theano.shared(value=value, name=name, strict=False)
 
 
-def placeholder(shape=None, ndim=None, dtype=_FLOATX, name=None):
+def placeholder(shape=None, ndim=None, dtype=_FLOATX, sparse=False, name=None):
     '''Instantiate an input data placeholder variable.
     '''
     if shape is None and ndim is None:
@@ -51,7 +77,11 @@ def placeholder(shape=None, ndim=None, dtype=_FLOATX, name=None):
         shape = tuple([None for _ in range(ndim)])
 
     broadcast = (False,) * ndim
-    x = T.TensorType(dtype, broadcast)(name)
+    if sparse:
+        _assert_sparse_module()
+        x = th_sparse_module.csr_matrix(name=name, dtype=dtype)
+    else:
+        x = T.TensorType(dtype, broadcast)(name)
     x._keras_shape = shape
     x._uses_learning_phase = False
     return x
@@ -77,7 +107,7 @@ def dtype(x):
 def eval(x):
     '''Run a graph.
     '''
-    return x.eval()
+    return to_dense(x).eval()
 
 
 def zeros(shape, dtype=_FLOATX, name=None):
@@ -156,7 +186,10 @@ Assumed overridden:
 
 
 def dot(x, y):
-    return T.dot(x, y)
+    if is_sparse(x):
+        return th_sparse_module.basic.structured_dot(x, y)
+    else:
+        return T.dot(x, y)
 
 
 def batch_dot(x, y, axes=None):
@@ -362,6 +395,19 @@ def normalize_batch_in_training(x, gamma, beta,
                                 reduction_axes, epsilon=0.0001):
     '''Compute mean and std for batch then apply batch_normalization on batch.
     '''
+    dev = theano.config.device
+    use_cudnn = ndim(x) < 5 and reduction_axes == [0, 2, 3] and (dev.startswith('cuda') or dev.startswith('gpu'))
+    if use_cudnn:
+        broadcast_beta = beta.dimshuffle('x', 0, 'x', 'x')
+        broadcast_gamma = gamma.dimshuffle('x', 0, 'x', 'x')
+        try:
+            normed, mean, stdinv = theano.sandbox.cuda.dnn.dnn_batch_normalization_train(
+                x, broadcast_gamma, broadcast_beta, 'spatial', epsilon)
+            var = T.inv(stdinv ** 2)
+            return normed, T.flatten(mean), T.flatten(var)
+        except AttributeError:
+            pass
+
     var = x.var(reduction_axes)
     mean = x.mean(reduction_axes)
 
@@ -386,16 +432,32 @@ def normalize_batch_in_training(x, gamma, beta,
 def batch_normalization(x, mean, var, beta, gamma, epsilon=0.0001):
     '''Apply batch normalization on x given mean, var, beta and gamma.
     '''
-    normed = T.nnet.bn.batch_normalization(x, gamma, beta, mean,
-                                           sqrt(var) + epsilon,
-                                           mode='high_mem')
-    return normed
+    ndim = x.ndim
+    dev = theano.config.device
+    use_cudnn = ndim < 5 and (dev.startswith('cuda') or dev.startswith('gpu'))
+    if use_cudnn:
+        try:
+            return theano.sandbox.cuda.dnn.dnn_batch_normalization_test(x, gamma, beta, mean, var,
+                                                                        'spatial', epsilon)
+        except AttributeError:
+            pass
+    return T.nnet.bn.batch_normalization(x, gamma, beta, mean, sqrt(var + epsilon),
+                                         mode='high_mem')
 
 
 # SHAPE OPERATIONS
 
 def concatenate(tensors, axis=-1):
-    return T.concatenate(tensors, axis=axis)
+    if py_all([is_sparse(x) for x in tensors]):
+        axis = axis % ndim(tensors[0])
+        if axis == 0:
+            return th_sparse_module.basic.vstack(tensors, format='csr')
+        elif axis == 1:
+            return th_sparse_module.basic.hstack(tensors, format='csr')
+        else:
+            raise Exception('Invalid concat axis for sparse matrix: ' + axis)
+    else:
+        return T.concatenate([to_dense(x) for x in tensors], axis=axis)
 
 
 def reshape(x, shape):
@@ -504,11 +566,9 @@ def expand_dims(x, dim=-1):
 def squeeze(x, axis):
     '''Remove a 1-dimension from the tensor at index "axis".
     '''
-    broadcastable = x.broadcastable[:axis] + x.broadcastable[axis+1:]
-    x = T.patternbroadcast(x, [i == axis for i in range(x.type.ndim)])
-    x = T.squeeze(x)
-    x = T.patternbroadcast(x, broadcastable)
-    return x
+    shape = list(x.shape)
+    shape.pop(axis)
+    return T.reshape(x, tuple(shape))
 
 
 def temporal_padding(x, padding=1):
@@ -526,7 +586,7 @@ def temporal_padding(x, padding=1):
     return T.set_subtensor(output[:, padding:x.shape[1] + padding, :], x)
 
 
-def spatial_2d_padding(x, padding=(1, 1), dim_ordering='th'):
+def spatial_2d_padding(x, padding=(1, 1), dim_ordering=_IMAGE_DIM_ORDERING):
     '''Pad the 2nd and 3rd dimensions of a 4D tensor
     with "padding[0]" and "padding[1]" (resp.) zeros left and right.
     '''
@@ -557,7 +617,7 @@ def spatial_2d_padding(x, padding=(1, 1), dim_ordering='th'):
     return T.set_subtensor(output[indices], x)
 
 
-def spatial_3d_padding(x, padding=(1, 1, 1), dim_ordering='th'):
+def spatial_3d_padding(x, padding=(1, 1, 1), dim_ordering=_IMAGE_DIM_ORDERING):
     '''Pad the 2nd, 3rd and 4th dimensions of a 5D tensor
     with "padding[0]", "padding[1]" and "padding[2]" (resp.) zeros left and right.
     '''
@@ -597,15 +657,24 @@ def pack(x):
 
 
 def one_hot(indices, nb_classes):
-    '''
-    Input: nD integer tensor of shape (batch_size, dim1, dim2, ... dim(n-1))
-    Output: (n + 1)D one hot representation of the input with shape (batch_size, dim1, dim2, ... dim(n-1), nb_classes)
+    '''Input: nD integer tensor of shape (batch_size, dim1, dim2, ... dim(n-1))
+    Output: (n + 1)D one hot representation of the input
+    with shape (batch_size, dim1, dim2, ... dim(n-1), nb_classes)
     '''
     input_shape = tuple((indices.shape[i] for i in range(indices.ndim)))
     indices = T.flatten(indices)
     oh = T.extra_ops.to_one_hot(indices, nb_classes)
     oh = T.reshape(oh, input_shape + (nb_classes,))
     return oh
+
+
+def reverse(x, axes):
+    '''Reverse a tensor along the the specified axes
+    '''
+    if type(axes) == int:
+        axes = [axes]
+    slices = [slice(None, None, -1) if i in axes else slice(None, None, None) for i in range(x.ndim)]
+    return x[slices]
 
 
 # VALUE MANIPULATION
@@ -632,6 +701,10 @@ def set_value(x, value):
 def batch_set_value(tuples):
     for x, value in tuples:
         x.set_value(np.asarray(value, dtype=x.dtype))
+
+
+def get_variable_shape(x):
+    return x.get_value(borrow=True, return_internal_type=True).shape
 
 
 def print_tensor(x, message=''):
@@ -871,11 +944,26 @@ def in_test_phase(x, alt):
 
 # NN OPERATIONS
 
+def _assert_has_capability(module, func):
+    assert hasattr(module, func), ('It looks like like your version of '
+                                   'Theano is out of date. '
+                                   'Install the latest version with:\n'
+                                   'pip install git+git://github.com/Theano/Theano.git --upgrade --no-deps')
+
+
+def elu(x, alpha=1.0):
+    """ Exponential linear unit
+
+    # Arguments
+        x: Tensor to compute the activation function for.
+        alpha: scalar
+    """
+    _assert_has_capability(T.nnet, 'elu')
+    return T.nnet.elu(x, alpha)
+
+
 def relu(x, alpha=0., max_value=None):
-    assert hasattr(T.nnet, 'relu'), ('It looks like like your version of '
-                                     'Theano is out of date. '
-                                     'Install the latest version with:\n'
-                                     'pip install git+git://github.com/Theano/Theano.git --upgrade --no-deps')
+    _assert_has_capability(T.nnet, 'relu')
     x = T.nnet.relu(x, alpha)
     if max_value is not None:
         x = T.minimum(x, max_value)
@@ -932,14 +1020,33 @@ def tanh(x):
     return T.tanh(x)
 
 
-def dropout(x, level, seed=None):
+def dropout(x, level, noise_shape=None, seed=None):
+    '''Sets entries in `x` to zero at random,
+    while scaling the entire tensor.
+
+    # Arguments
+        x: tensor
+        level: fraction of the entries in the tensor
+            that will be set to 0.
+        noise_shape: shape for randomly generated keep/drop flags,
+            must be broadcastable to the shape of `x`
+        seed: random seed to ensure determinism.
+    '''
     if level < 0. or level >= 1:
         raise Exception('Dropout level must be in interval [0, 1[.')
     if seed is None:
         seed = np.random.randint(1, 10e6)
+
     rng = RandomStreams(seed=seed)
     retain_prob = 1. - level
-    x *= rng.binomial(x.shape, p=retain_prob, dtype=x.dtype)
+
+    if noise_shape is None:
+        random_tensor = rng.binomial(x.shape, p=retain_prob, dtype=x.dtype)
+    else:
+        random_tensor = rng.binomial(noise_shape, p=retain_prob, dtype=x.dtype)
+        random_tensor = T.patternbroadcast(random_tensor, [dim == 1 for dim in noise_shape])
+
+    x *= random_tensor
     x /= retain_prob
     return x
 
@@ -947,6 +1054,23 @@ def dropout(x, level, seed=None):
 def l2_normalize(x, axis):
     norm = T.sqrt(T.sum(T.square(x), axis=axis, keepdims=True))
     return x / norm
+
+
+def in_top_k(predictions, targets, k):
+    '''Says whether the `targets` are in the top `k` `predictions`
+
+    # Arguments
+        predictions: A tensor of shape batch_size x classess and type float32.
+        targets: A tensor of shape batch_size and type int32 or int64.
+        k: An int, number of top elements to consider.
+
+    # Returns
+        A tensor of shape batch_size and type int. output_i is 1 if
+        targets_i is within top-k values of predictions_i
+    '''
+    predictions_top_k = T.argsort(predictions)[:, -k:]
+    result, _ = theano.map(lambda prediction, target: any(equal(prediction, target)), sequences=[predictions_top_k, targets])
+    return result
 
 
 # CONVOLUTIONS
@@ -1118,7 +1242,7 @@ def separable_conv2d(x, depthwise_kernel, pointwise_kernel, strides=(1, 1),
 
 
 def conv3d(x, kernel, strides=(1, 1, 1),
-           border_mode='valid', dim_ordering='th',
+           border_mode='valid', dim_ordering=_IMAGE_DIM_ORDERING,
            volume_shape=None, filter_shape=None):
     '''
     Run on cuDNN if available.
@@ -1180,7 +1304,7 @@ def conv3d(x, kernel, strides=(1, 1, 1),
 
 
 def pool2d(x, pool_size, strides=(1, 1), border_mode='valid',
-           dim_ordering='th', pool_mode='max'):
+           dim_ordering=_IMAGE_DIM_ORDERING, pool_mode='max'):
     if border_mode == 'same':
         w_pad = pool_size[0] - 2 if pool_size[0] % 2 == 1 else pool_size[0] - 1
         h_pad = pool_size[1] - 2 if pool_size[1] % 2 == 1 else pool_size[1] - 1
@@ -1223,7 +1347,7 @@ def pool2d(x, pool_size, strides=(1, 1), border_mode='valid',
 
 
 def pool3d(x, pool_size, strides=(1, 1, 1), border_mode='valid',
-           dim_ordering='th', pool_mode='max'):
+           dim_ordering=_IMAGE_DIM_ORDERING, pool_mode='max'):
     if border_mode == 'same':
         # TODO: add implementation for border_mode="same"
         raise Exception('border_mode="same" not supported with Theano.')
@@ -1302,3 +1426,105 @@ def random_binomial(shape, p=0.0, dtype=_FLOATX, seed=None):
         seed = np.random.randint(1, 10e6)
     rng = RandomStreams(seed=seed)
     return rng.binomial(shape, p=p, dtype=dtype)
+
+# Theano implementation of CTC
+# Used with permission from Shawn Tan
+# https://github.com/shawntan/
+# Note that tensorflow's native CTC code is significantly
+# faster than this
+
+def ctc_interleave_blanks(Y):
+    Y_ = T.alloc(-1, Y.shape[0] * 2 + 1)
+    Y_ = T.set_subtensor(Y_[T.arange(Y.shape[0]) * 2 + 1], Y)
+    return Y_
+
+def ctc_create_skip_idxs(Y):
+    skip_idxs = T.arange((Y.shape[0] - 3) // 2) * 2 + 1
+    non_repeats = T.neq(Y[skip_idxs], Y[skip_idxs + 2])
+    return skip_idxs[non_repeats.nonzero()]
+
+def ctc_update_log_p(skip_idxs, zeros, active, log_p_curr, log_p_prev):
+    active_skip_idxs = skip_idxs[(skip_idxs < active).nonzero()]
+    active_next = T.cast(T.minimum(
+        T.maximum(
+            active + 1,
+            T.max(T.concatenate([active_skip_idxs, [-1]])) + 2 + 1
+        ), log_p_curr.shape[0]), 'int32')
+
+    common_factor = T.max(log_p_prev[:active])
+    p_prev = T.exp(log_p_prev[:active] - common_factor)
+    _p_prev = zeros[:active_next]
+    # copy over
+    _p_prev = T.set_subtensor(_p_prev[:active], p_prev)
+    # previous transitions
+    _p_prev = T.inc_subtensor(_p_prev[1:], _p_prev[:-1])
+    # skip transitions
+    _p_prev = T.inc_subtensor(_p_prev[active_skip_idxs + 2], p_prev[active_skip_idxs])
+    updated_log_p_prev = T.log(_p_prev) + common_factor
+
+    log_p_next = T.set_subtensor(
+        zeros[:active_next],
+        log_p_curr[:active_next] + updated_log_p_prev
+    )
+    return active_next, log_p_next
+
+def ctc_path_probs(predict, Y, alpha=1e-4):
+    smoothed_predict = (1 - alpha) * predict[:, Y] + alpha * np.float32(1.) / Y.shape[0]
+    L = T.log(smoothed_predict)
+    zeros = T.zeros_like(L[0])
+    base = T.set_subtensor(zeros[:1], np.float32(1))
+    log_first = zeros
+
+    f_skip_idxs = ctc_create_skip_idxs(Y)
+    b_skip_idxs = ctc_create_skip_idxs(Y[::-1])  # there should be a shortcut to calculating this
+
+    def step(log_f_curr, log_b_curr, f_active, log_f_prev, b_active, log_b_prev):
+        f_active_next, log_f_next = ctc_update_log_p(f_skip_idxs, zeros, f_active, log_f_curr, log_f_prev)
+        b_active_next, log_b_next = ctc_update_log_p(b_skip_idxs, zeros, b_active, log_b_curr, log_b_prev)
+        return f_active_next, log_f_next, b_active_next, log_b_next
+
+    [f_active, log_f_probs, b_active, log_b_probs], _ = theano.scan(
+        step, sequences=[L, L[::-1, ::-1]], outputs_info=[np.int32(1), log_first, np.int32(1), log_first])
+
+    idxs = T.arange(L.shape[1]).dimshuffle('x', 0)
+    mask = (idxs < f_active.dimshuffle(0, 'x')) & (idxs < b_active.dimshuffle(0, 'x'))[::-1, ::-1]
+    log_probs = log_f_probs + log_b_probs[::-1, ::-1] - L
+    return log_probs, mask
+
+def ctc_cost(predict, Y):
+    log_probs, mask = ctc_path_probs(predict, ctc_interleave_blanks(Y))
+    common_factor = T.max(log_probs)
+    total_log_prob = T.log(T.sum(T.exp(log_probs - common_factor)[mask.nonzero()])) + common_factor
+    return -total_log_prob
+
+# batchifies original CTC code
+def ctc_batch_cost(y_true, y_pred, input_length, label_length):
+    '''Runs CTC loss algorithm on each batch element.
+
+    # Arguments
+        y_true: tensor (samples, max_string_length) containing the truth labels
+        y_pred: tensor (samples, time_steps, num_categories) containing the prediction,
+                or output of the softmax
+        input_length: tensor (samples,1) containing the sequence length for
+                each batch item in y_pred
+        label_length: tensor (samples,1) containing the sequence length for
+                each batch item in y_true
+
+    # Returns
+        Tensor with shape (samples,1) containing the
+            CTC loss of each element
+    '''
+
+    def ctc_step(y_true_step, y_pred_step, input_length_step, label_length_step):
+        y_pred_step = y_pred_step[0: input_length_step[0]]
+        y_true_step = y_true_step[0:label_length_step[0]]
+        return ctc_cost(y_pred_step, y_true_step)
+
+    ret, _ = theano.scan(
+        fn = ctc_step,
+        outputs_info=None,
+        sequences=[y_true, y_pred, input_length, label_length]
+    )
+
+    ret = ret.dimshuffle('x', 0)
+    return ret
