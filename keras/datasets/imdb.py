@@ -98,7 +98,7 @@ def load_data(path='imdb_full.pkl', nb_words=None, skip_top=0,
     X_test = np.array(X[len(x_train):])
     y_test = np.array(labels[len(x_train):])
 
-    return (X_train, y_train), (X_test, y_test)
+    return (X_train, y_train), (X_test, y_test), nb_words
 
 
 def get_word_index(path='imdb_word_index.pkl'):

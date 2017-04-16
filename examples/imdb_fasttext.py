@@ -71,7 +71,7 @@ max_features = 20000
 maxlen = 400
 batch_size = 32
 embedding_dims = 50
-nb_epoch = 5
+nb_epoch = 10
 
 print('Loading data...')
 (X_train, y_train), (X_test, y_test) = imdb.load_data(nb_words=max_features)
@@ -110,6 +110,7 @@ X_train = sequence.pad_sequences(X_train, maxlen=maxlen)
 X_test = sequence.pad_sequences(X_test, maxlen=maxlen)
 print('X_train shape:', X_train.shape)
 print('X_test shape:', X_test.shape)
+print('y_train shape:', y_train.shape)
 
 print('Build model...')
 model = Sequential()
